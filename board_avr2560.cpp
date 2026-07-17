@@ -1,0 +1,295 @@
+#include "board_definition.h"
+
+#if defined(CORE_AVR)
+#include "globals.h"
+#include "auxiliaries.h"
+#include "comms_secondary.h"
+#include "idle.h"
+#include "timers.h"
+#ifdef USE_SPI_EEPROM
+  #include "src/SPIAsEEPROM/SPIAsEEPROM.h"
+#else
+  #include <EEPROM.h>
+#endif
+#include "board_eeprom_adapter.hpp"
+#include "scheduler_ignition_controller.h"
+#include "scheduler_fuel_controller.h"
+
+// Prescaler values for timers 1-3-4-5. Refer to www.instructables.com/files/orig/F3T/TIKL/H3WSA4V7/F3TTIKLH3WSA4V7.jpg
+#define TIMER_PRESCALER_OFF  ((0<<CS12)|(0<<CS11)|(0<<CS10))
+#define TIMER_PRESCALER_1    ((0<<CS12)|(0<<CS11)|(1<<CS10))
+#define TIMER_PRESCALER_8    ((0<<CS12)|(1<<CS11)|(0<<CS10))
+#define TIMER_PRESCALER_64   ((0<<CS12)|(1<<CS11)|(1<<CS10))
+#define TIMER_PRESCALER_256  ((1<<CS12)|(0<<CS11)|(0<<CS10))
+#define TIMER_PRESCALER_1024 ((1<<CS12)|(0<<CS11)|(1<<CS10))
+
+#define TIMER_MODE_NORMAL    ((0<<WGM01)|(0<<WGM00))
+#define TIMER_MODE_PWM       ((0<<WGM01)|(1<<WGM00))
+#define TIMER_MODE_CTC       ((1<<WGM01)|(0<<WGM00))
+#define TIMER_MODE_FASTPWM   ((1<<WGM01)|(1<<WGM00))
+
+#define FUEL_INTERRUPT(index, avr_vector) \
+  ISR((avr_vector)) { \
+    moveToNextState(fuelSchedule ## index); \
+  }
+
+/** @brief ISR for fuel channel 1 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(1, TIMER3_COMPA_vect)
+#if INJ_CHANNELS >= 2
+/** @brief ISR for fuel channel 2 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(2, TIMER3_COMPB_vect)
+#endif
+#if INJ_CHANNELS >= 3
+/** @brief ISR for fuel channel 3 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(3, TIMER3_COMPC_vect)
+#endif
+#if INJ_CHANNELS >= 4
+/** @brief ISR for fuel channel 4 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(4, TIMER4_COMPB_vect)
+#endif
+#if INJ_CHANNELS >= 5
+/** @brief ISR for fuel channel 5 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(5, TIMER4_COMPC_vect)
+#endif
+#if INJ_CHANNELS >= 6
+/** @brief ISR for fuel channel 6 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(6, TIMER4_COMPA_vect)
+#endif
+#if INJ_CHANNELS >= 7
+/** @brief ISR for fuel channel 7 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(7, TIMER5_COMPC_vect)
+#endif
+#if INJ_CHANNELS >= 8
+/** @brief ISR for fuel channel 8 */
+// cppcheck-suppress misra-c2012-8.2
+FUEL_INTERRUPT(8, TIMER5_COMPB_vect)
+#endif
+
+#define IGNITION_INTERRUPT(index, avr_vector) \
+  ISR((avr_vector)) { \
+    moveToNextState(ignitionSchedule ## index); \
+  }
+
+/** @brief ISR for ignition channel 1 */
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(1, TIMER5_COMPA_vect)
+#if IGN_CHANNELS >= 2
+/** @brief ISR for ignition channel 2 */
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(2, TIMER5_COMPB_vect)
+#endif
+#if IGN_CHANNELS >= 3
+/** @brief ISR for ignition channel 3 */
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(3, TIMER5_COMPC_vect)
+#endif
+#if IGN_CHANNELS >= 4
+/** @brief ISR for ignition channel 4 */
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(4, TIMER4_COMPA_vect)
+#endif
+#if IGN_CHANNELS >= 5
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(5, TIMER4_COMPC_vect)
+#endif
+#if IGN_CHANNELS >= 6
+/** @brief ISR for ignition channel 6 */
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(6, TIMER4_COMPB_vect)
+#endif
+#if IGN_CHANNELS >= 7
+/** @brief ISR for ignition channel 7 */
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(7, TIMER3_COMPC_vect)
+#endif
+#if IGN_CHANNELS >= 8
+/** @brief ISR for ignition channel 8 */
+// cppcheck-suppress misra-c2012-8.2
+IGNITION_INTERRUPT(8, TIMER3_COMPB_vect)
+#endif
+
+ISR(TIMER1_COMPC_vect) //cppcheck-suppress misra-c2012-8.2
+{
+  idleInterrupt();
+}
+
+//Timer2 Overflow Interrupt Vector, called when the timer overflows.
+//Executes every ~1ms.
+//This MUST be no block. Turning NO_BLOCK off messes with timing accuracy. 
+ISR(TIMER2_OVF_vect, ISR_NOBLOCK) //cppcheck-suppress misra-c2012-8.2
+{
+  oneMSInterval();
+}
+
+//The interrupt to control the Boost PWM
+ISR(TIMER1_COMPA_vect) //cppcheck-suppress misra-c2012-8.2
+{
+  boostInterrupt();
+}
+
+ISR(TIMER1_COMPB_vect) //cppcheck-suppress misra-c2012-8.2
+{
+  vvtInterrupt();
+}
+
+void initBoard(uint32_t baudRate)
+{
+    /*
+    ***********************************************************************************************************
+    * General
+    */
+    configPage9.intcan_available = 0;   // AVR devices do NOT have internal canbus
+    pSecondarySerial = &Serial3;
+
+    /*
+    ***********************************************************************************************************
+    * Auxiliaries
+    */
+    //PWM used by the Boost and VVT outputs. C Channel is used by ign5
+    TCCR1B = TIMER_PRESCALER_OFF;   //Disable Timer1 while we set it up
+    TCNT1  = 0;                     //Reset Timer Count
+    TCCR1A = TIMER_MODE_NORMAL;     //Timer1 Control Reg A: Wave Gen Mode normal (Simply counts up from 0 to 65535 (16-bit int)
+    TCCR1B = TIMER_PRESCALER_256;   //Timer1 Control Reg B: Timer Prescaler set to 256. 1 tick = 16uS.
+    TIFR1 = (1 << OCF1A) | (1<<OCF1B) | (1<<OCF1C) | (1<<TOV1) | (1<<ICF1); //Clear the compare flags, overflow flag and external input flag bits
+
+    boost_pwm_max_count = (uint16_t)(MICROS_PER_SEC / (16U * configPage6.boostFreq * 2U)); //Converts the frequency in Hz to the number of ticks (at 16uS) it takes to complete 1 cycle. The x2 is there because the frequency is stored at half value (in a byte) to allow frequencies up to 511Hz
+    vvt_pwm_max_count = (uint16_t)(MICROS_PER_SEC / (16U * configPage6.vvtFreq * 2U)); //Converts the frequency in Hz to the number of ticks (at 16uS) it takes to complete 1 cycle
+    if (isPwmIac(configPage6))
+    {
+      idle_pwm_max_count = (uint16_t)(MICROS_PER_SEC / (16U * configPage6.idleFreq * 2U)); //Converts the frequency in Hz to the number of ticks (at 16uS) it takes to complete 1 cycle. Note that the frequency is divided by 2 coming from TS to allow for up to 512hz
+    }
+
+    /*
+    ***********************************************************************************************************
+    * Timers
+    */
+    //Configure Timer2 for our low-freq interrupt code.
+    TCCR2B = TIMER_PRESCALER_OFF;   //Disable Timer2 while we set it up
+    TCNT2  = 131;                   //Preload timer2 with 131 cycles, leaving 125 till overflow. As the timer runs at 125Khz, this causes overflow to occur at 1Khz = 1ms
+    TIMSK2 = (1<<TOIE2);            //Timer2 Set Overflow Interrupt enabled.
+    TCCR2A = TIMER_MODE_NORMAL;     //Timer2 Control Reg A: Wave Gen Mode normal
+    /* Now configure the prescaler to CPU clock divided by 128 = 125Khz */
+    TCCR2B = (1<<CS22)  | (1<<CS20); // Set bits. This timer uses different prescaler values, thus we cannot use the defines above.
+    TIFR2 = (1 << OCF2A) | (1<<OCF2B) | (1<<TOV2); //Clear the compare flag bits and overflow flag bit
+
+    //Enable the watchdog timer for 2 second resets (Good reference: www.tushev.org/articles/arduino/5/arduino-and-watchdog-timer)
+    //Boooooooooo WDT is currently broken on Mega 2560 bootloaders :(
+    //wdt_enable(WDTO_2S);
+
+    /*
+    ***********************************************************************************************************
+    * Schedules
+    * */
+    //Much help in this from www.arduinomega.blogspot.com.au/2011/05/timer2-and-overflow-interrupt-lets-get.html
+    //Fuel Schedules, which uses timer 3
+    TCCR3B = TIMER_PRESCALER_OFF;   //Disable Timer3 while we set it up
+    TCNT3  = 0;                     //Reset Timer Count
+    TCCR3A = TIMER_MODE_NORMAL;     //Timer3 Control Reg A: Wave Gen Mode normal
+    TCCR3B = TIMER_PRESCALER_64;    //Timer3 Control Reg B: Timer Prescaler set to 64.
+    TIFR3 = (1 << OCF3A) | (1<<OCF3B) | (1<<OCF3C) | (1<<TOV3) | (1<<ICF3); //Clear the compare flags, overflow flag and external input flag bits
+
+    //Ignition Schedules, which uses timer 5. This is also used by the fast version of micros(). If the speed of this timer is changed from 4uS ticks, that MUST be changed as well. See globals.h and timers.ino
+    TCCR5B = TIMER_PRESCALER_OFF;   //Disable Timer5 while we set it up
+    TCNT5  = 0;                     //Reset Timer Count
+    TCCR5A = TIMER_MODE_NORMAL;     //Timer5 Control Reg A: Wave Gen Mode normal
+    TCCR5B = TIMER_PRESCALER_64;    //Timer5 Control Reg B: Timer Prescaler set to 64.
+    TIFR5 = (1 << OCF5A) | (1<<OCF5B) | (1<<OCF5C) | (1<<TOV5) | (1<<ICF5); //Clear the compare flags, overflow flag and external input flag bits
+    
+    #if defined(TIMER5_MICROS)
+      TIMSK5 |= (1 << TOIE5); //Enable the timer5 overflow interrupt (See timers.ino for ISR)
+      TIMSK0 &= ~_BV(TOIE0); // disable timer0 overflow interrupt
+    #endif
+
+    //The remaining Schedules (Fuel schedule 4 and ignition schedules 4 and 5) use Timer4
+    TCCR4B = TIMER_PRESCALER_OFF;   //Disable Timer4 while we set it up
+    TCNT4  = 0;                     //Reset Timer Count
+    TCCR4A = TIMER_MODE_NORMAL;     //Timer4 Control Reg A: Wave Gen Mode normal
+    TCCR4B = TIMER_PRESCALER_64;    //Timer4 Control Reg B: Timer Prescaler set to 64.
+    TIFR4 = (1 << OCF4A) | (1<<OCF4B) | (1<<OCF4C) | (1<<TOV4) | (1<<ICF4); //Clear the compare flags, overflow flag and external input flag bits
+
+    Serial.begin(baudRate);
+}
+
+/*
+  Returns how much free dynamic memory exists (between heap and stack)
+  This function is one big MISRA violation. MISRA advisories forbid directly poking at memory addresses, however there is no other way of determining heap size on embedded systems.
+*/
+uint16_t freeRam(void)
+{
+    extern int __heap_start, *__brkval;
+    int currentVal;
+    uint16_t v;
+
+    if(__brkval == NULL) { 
+      currentVal = (int) &__heap_start;
+    } else { 
+      currentVal = (int) __brkval; 
+    }
+
+    //Old version:
+    //return (uint16_t) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
+    return (uint16_t) &v - currentVal; // cppcheck-suppress [misra-c2012-11.4, misra-c2012-10.4]
+}
+
+void doSystemReset(void) { return; }
+void jumpToBootloader(void) { return; }
+
+uint8_t getSystemTemp(void)
+{
+  //AVR2560 has no internal temperature monitoring, just return 0. 
+  return 0;
+}
+
+void boardInitRTC(void)
+{
+  // Do nothing
+}
+
+void boardInitPins(uint8_t)
+{
+  // Do nothing
+}
+
+static uint16_t getEepromWriteBlockSize(const statuses &current)
+{
+#if defined(USE_SPI_EEPROM)
+  //For use with common Winbond SPI EEPROMs Eg W25Q16JV
+  uint16_t maxWrite = 20U; //This needs tuning
+#else
+  uint16_t maxWrite = 18U;
+  if(current.commCompat) { maxWrite = 8U; } //If comms compatibility mode is on, slow the burn rate down even further
+
+  //In order to prevent missed pulses during EEPROM writes on AVR, scale the
+  //maximum write block size based on the RPM.
+  //This calculation is based on EEPROM writes taking approximately 4ms per byte
+  //(Actual value is 3.8ms, so 4ms has some safety margin) 
+  if(current.RPM > 65U) //Min RPM of 65 prevents overflow of uint8_t
+  { 
+    maxWrite = (uint16_t)(15000U / current.RPM);
+    maxWrite = constrain(maxWrite, 1U, 15U); //Any higher than this will cause comms timeouts on AVR
+  }
+#endif
+
+  // Write to EEPROM more aggressively if the engine is not running
+  if(current.RPM==0U)
+  { 
+    return maxWrite * 8U;
+  } 
+
+  return maxWrite;
+}
+
+/** @brief Get the EEPROM storage API for the board */
+storage_api_t getBoardStorageApi(void)
+{
+  return getEEPROMStorageApi(getEepromWriteBlockSize);
+}
+
+#endif //CORE_AVR

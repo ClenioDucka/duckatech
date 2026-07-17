@@ -1,0 +1,387 @@
+#pragma once
+
+/** DO NOT INCLUDE DIRECTLY - should be included via board_definition.h */
+
+#include <Arduino.h>
+#include <HardwareTimer.h>
+#include <HardwareSerial.h>
+#include "STM32RTC.h"
+#include <SPI.h>
+
+#define CORE_STM32
+
+#ifndef PLATFORMIO
+#ifndef USBCON
+  #error "USBCON must be defined in boards.txt"
+#endif
+#ifndef USBD_USE_CDC
+  #error "USBD_USE_CDC must be defined in boards.txt"
+#endif
+#endif
+
+#if defined(STM32F1)
+  #include "stm32f1xx_ll_tim.h"
+#elif defined(STM32F3)
+  #include "stm32f3xx_ll_tim.h"
+#elif defined(STM32F4)
+  #include "stm32f4xx_ll_tim.h"
+  #if defined(STM32F407xx) && !defined(HAL_CAN_MODULE_ENABLED)
+    #warning "CAN module is not enabled. Internal CAN will NOT be available"
+  #endif
+#else /*Default should be STM32F4*/
+  #include "stm32f4xx_ll_tim.h"
+#endif
+
+/*
+***********************************************************************************************************
+* General
+*/
+
+/** @brief The timer overflow type
+ * 
+ * On some boards timers can overflow at less than the timer register width
+ */
+using COMPARE_TYPE = uint16_t;
+
+/** @brief The timer tick length in µS */
+constexpr uint32_t TIMER_RESOLUTION = 4U;
+
+/** @brief Converts a given number of uS into the required number of timer ticks until that time has passed */
+static constexpr COMPARE_TYPE uS_TO_TIMER_COMPARE(uint32_t micros)
+{
+  // Faster than micros/TIMER_RESOLUTION
+  constexpr uint32_t SHIFT = TIMER_RESOLUTION/2U;
+  return (COMPARE_TYPE)(micros >> SHIFT); 
+}
+
+/** @brief Convert timer ticks to µS */
+static constexpr uint32_t ticksToMicros(COMPARE_TYPE ticks)
+{
+  return ticks * TIMER_RESOLUTION;
+}
+
+#define TS_SERIAL_BUFFER_SIZE 517 //Size of the serial buffer used by new comms protocol. For SD transfers this must be at least 512 + 1 (flag) + 4 (sector)
+#define FPU_MAX_SIZE 32 //Size of the FPU buffer. 0 means no FPU.
+constexpr uint16_t BLOCKING_FACTOR = 121;
+constexpr uint16_t TABLE_BLOCKING_FACTOR = 64;
+
+#ifndef word
+  #define word(h, l) (((h) << 8) | (l)) //word() function not defined for this platform in the main library
+#endif  
+  
+#if defined(ARDUINO_BLUEPILL_F103C8) || defined(ARDUINO_BLUEPILL_F103CB) \
+  || defined(ARDUINO_BLACKPILL_F401CC) || defined(ARDUINO_BLACKPILL_F411CE)
+  //STM32 Pill boards
+  #ifndef NUM_DIGITAL_PINS
+    #define NUM_DIGITAL_PINS 35
+  #endif
+  #ifndef LED_BUILTIN
+    #define LED_BUILTIN PB1 //Maple Mini
+  #endif
+#elif defined(STM32F407xx)
+  #ifndef NUM_DIGITAL_PINS
+    #define NUM_DIGITAL_PINS 75
+  #endif
+#elif defined(BOARD_FCR_MICRO_F4)
+  #ifndef NUM_DIGITAL_PINS
+    #define NUM_DIGITAL_PINS 100
+  #endif
+  #define BOARD_ANALOG_SCALE_NUM 5148
+  #define BOARD_ANALOG_SCALE_DEN 5000
+#endif
+
+//Specific mode for Bluepill due to its small flash size. This disables a number of strings from being compiled into the flash
+#if defined(MCU_STM32F103C8) || defined(MCU_STM32F103CB)
+  #define SMALL_FLASH_MODE
+#endif
+
+#define BOARD_MAX_DIGITAL_PINS NUM_DIGITAL_PINS
+#define BOARD_MAX_IO_PINS NUM_DIGITAL_PINS
+#if __GNUC__ < 7 //Already included on GCC 7
+extern "C" char* sbrk(int incr); //Used to freeRam
+#endif
+#ifndef digitalPinToInterrupt
+inline uint32_t  digitalPinToInterrupt(uint32_t Interrupt_pin) { return Interrupt_pin; } //This isn't included in the stm32duino libs (yet)
+#endif
+
+#if defined(USER_BTN) 
+  #define EEPROM_RESET_PIN USER_BTN //onboard key0 for black STM32F407 boards and blackpills, keep pressed during boot to reset eeprom
+#endif
+
+#if defined(STM32F407xx)
+  //Comment out this to disable SD logging for STM32 if needed. Currently SD logging for STM32 is experimental feature for F407.
+  #define SD_LOGGING
+#endif
+
+#if defined(SD_LOGGING)
+  #define RTC_ENABLED
+  //SD logging with STM32 uses SD card in SPI mode, because used SD library doesn't support SDIO implementation. By default SPI3 is used that uses same pins as SDIO also, but in different order.
+  extern SPIClass SD_SPI; //SPI3_MOSI, SPI3_MISO, SPI3_SCK
+  #define SD_CONFIG SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(50), &SD_SPI)
+  //Alternatively same SPI bus can be used as there is for SPI flash. But this is not recommended due to slower speed and other possible problems.
+  //#define SD_CONFIG SdSpiConfig(SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(50), &SPI_for_flash)
+#endif
+
+//When building for Black board Serial1 is instantiated,building generic STM32F4x7 has serial2 and serial 1 must be done here
+#if SERIAL_UART_INSTANCE==2
+HardwareSerial Serial1(PA10, PA9);
+#endif
+
+extern STM32RTC& rtc;
+
+#if defined(ARDUINO_BLUEPILL_F103C8) || defined(ARDUINO_BLUEPILL_F103CB) \
+ || defined(ARDUINO_BLACKPILL_F401CC) || defined(ARDUINO_BLACKPILL_F411CE)
+  static inline bool pinIsReserved(uint8_t pin) { 
+    return (pin == (uint8_t)PA11) 
+        || (pin == (uint8_t)PA12) 
+        || (pin == (uint8_t)PC14) 
+        || (pin == (uint8_t)PC15)
+      ;
+  }
+
+  #ifndef PB11 //Hack for F4 BlackPills
+    #define PB11 PB10
+  #endif
+  //Hack to allow compilation on small STM boards
+  #ifndef A10
+    #define A10  PA0
+    #define A11  PA1
+    #define A12  PA2
+    #define A13  PA3
+    #define A14  PA4
+    #define A15  PA5
+  #endif
+#else
+  #ifdef USE_SPI_EEPROM
+    #if defined(BOARD_FCR_MICRO_F4) //FCR Micro F4: USB(PA11/PA12) + VBUS sense(PA9) + SPI3 flash(PC10/11/12) + CS + CAN1 ALT_2(PD0/PD1)
+    static inline bool pinIsReserved(uint8_t pin) {
+      PinName p = digitalPinToPinName(pin);
+      return (p == PA_11)
+          || (p == PA_12)
+          || (p == PA_9)
+          || (p == PC_10)
+          || (p == PC_11)
+          || (p == PC_12)
+          || (p == (PinName)USE_SPI_EEPROM)
+          || (p == PD_0)
+          || (p == PD_1)
+        ;
+    }
+    #else
+    static inline bool pinIsReserved(uint8_t pin) {
+      return (pin == (uint8_t)PA11)
+          || (pin == (uint8_t)PA12)
+          || (pin == (uint8_t)PB3)
+          || (pin == (uint8_t)PB4)
+          || (pin == (uint8_t)USE_SPI_EEPROM)
+        ;
+    }
+    #endif
+  #else
+    static inline bool pinIsReserved(uint8_t pin) { 
+      return (pin == (uint8_t)PA11) 
+          || (pin == (uint8_t)PA12)
+          || (pin == (uint8_t)PB3) 
+          || (pin == (uint8_t)PB4)
+          || (pin == (uint8_t)PB5)
+          || (pin == (uint8_t)PB0)
+         ;
+    }
+  #endif
+#endif
+
+#define PWM_FAN_AVAILABLE
+
+#ifndef LED_BUILTIN
+  #define LED_BUILTIN PA7
+#endif
+
+/*
+***********************************************************************************************************
+* EEPROM emulation
+*/
+#if defined(STM32F401xC)
+  #define SMALL_FLASH_MODE
+#endif
+
+#define RTC_LIB_H "STM32RTC.h"
+
+/*
+***********************************************************************************************************
+* Schedules
+* Timers Table for STM32F1
+*   TIMER1    TIMER2    TIMER3    TIMER4
+* 1 - FAN   1 - INJ1  1 - IGN1  1 - oneMSInterval
+* 2 - BOOST 2 - INJ2  2 - IGN2  2 -
+* 3 - VVT   3 - INJ3  3 - IGN3  3 -
+* 4 - IDLE  4 - INJ4  4 - IGN4  4 -
+*
+* Timers Table for STM32F4
+*   TIMER1  |  TIMER2  |  TIMER3  |  TIMER4  |  TIMER5  |  TIMER11
+* 1 - FAN   |1 - IGN1  |1 - INJ1  |1 - IGN5  |1 - INJ5  |1 - oneMSInterval
+* 2 - BOOST |2 - IGN2  |2 - INJ2  |2 - IGN6  |2 - INJ6  |
+* 3 - VVT   |3 - IGN3  |3 - INJ3  |3 - IGN7  |3 - INJ7  |
+* 4 - IDLE  |4 - IGN4  |4 - INJ4  |4 - IGN8  |4 - INJ8  | 
+*/
+#if defined(STM32F407xx) //F407 can do 8x8 STM32F401/STM32F411 don't
+  #ifndef INJ_CHANNELS
+    #define INJ_CHANNELS 8
+  #endif
+  #ifndef IGN_CHANNELS
+    #define IGN_CHANNELS 8
+  #endif
+#else
+  #ifndef INJ_CHANNELS
+    #define INJ_CHANNELS 4
+  #endif
+  #ifndef IGN_CHANNELS
+    #define IGN_CHANNELS 5
+  #endif
+#endif
+#define FUEL1_COUNTER (TIM3)->CNT
+#define FUEL2_COUNTER (TIM3)->CNT
+#define FUEL3_COUNTER (TIM3)->CNT
+#define FUEL4_COUNTER (TIM3)->CNT
+
+#define FUEL1_COMPARE (TIM3)->CCR1
+#define FUEL2_COMPARE (TIM3)->CCR2
+#define FUEL3_COMPARE (TIM3)->CCR3
+#define FUEL4_COMPARE (TIM3)->CCR4
+
+#define IGN1_COUNTER  (TIM2)->CNT
+#define IGN2_COUNTER  (TIM2)->CNT
+#define IGN3_COUNTER  (TIM2)->CNT
+#define IGN4_COUNTER  (TIM2)->CNT
+
+#define IGN1_COMPARE (TIM2)->CCR1
+#define IGN2_COMPARE (TIM2)->CCR2
+#define IGN3_COMPARE (TIM2)->CCR3
+#define IGN4_COMPARE (TIM2)->CCR4
+
+#define FUEL5_COUNTER (TIM5)->CNT
+#define FUEL6_COUNTER (TIM5)->CNT
+#define FUEL7_COUNTER (TIM5)->CNT
+#define FUEL8_COUNTER (TIM5)->CNT
+
+#define FUEL5_COMPARE (TIM5)->CCR1
+#define FUEL6_COMPARE (TIM5)->CCR2
+#define FUEL7_COMPARE (TIM5)->CCR3
+#define FUEL8_COMPARE (TIM5)->CCR4
+
+#define IGN5_COUNTER  (TIM4)->CNT
+#define IGN6_COUNTER  (TIM4)->CNT
+#define IGN7_COUNTER  (TIM4)->CNT
+#define IGN8_COUNTER  (TIM4)->CNT
+
+#define IGN5_COMPARE (TIM4)->CCR1
+#define IGN6_COMPARE (TIM4)->CCR2
+#define IGN7_COMPARE (TIM4)->CCR3
+#define IGN8_COMPARE (TIM4)->CCR4
+
+  
+static inline void FUEL1_TIMER_ENABLE(void) {(TIM3)->CR1 |= TIM_CR1_CEN; (TIM3)->SR = ~TIM_FLAG_CC1; (TIM3)->DIER |= TIM_DIER_CC1IE;}
+static inline void FUEL2_TIMER_ENABLE(void) {(TIM3)->CR1 |= TIM_CR1_CEN; (TIM3)->SR = ~TIM_FLAG_CC2; (TIM3)->DIER |= TIM_DIER_CC2IE;}
+static inline void FUEL3_TIMER_ENABLE(void) {(TIM3)->CR1 |= TIM_CR1_CEN; (TIM3)->SR = ~TIM_FLAG_CC3; (TIM3)->DIER |= TIM_DIER_CC3IE;}
+static inline void FUEL4_TIMER_ENABLE(void) {(TIM3)->CR1 |= TIM_CR1_CEN; (TIM3)->SR = ~TIM_FLAG_CC4; (TIM3)->DIER |= TIM_DIER_CC4IE;}
+
+static inline void FUEL1_TIMER_DISABLE(void) {(TIM3)->DIER &= ~TIM_DIER_CC1IE;}
+static inline void FUEL2_TIMER_DISABLE(void) {(TIM3)->DIER &= ~TIM_DIER_CC2IE;}
+static inline void FUEL3_TIMER_DISABLE(void) {(TIM3)->DIER &= ~TIM_DIER_CC3IE;}
+static inline void FUEL4_TIMER_DISABLE(void) {(TIM3)->DIER &= ~TIM_DIER_CC4IE;}
+
+static inline void IGN1_TIMER_ENABLE(void)  {(TIM2)->CR1 |= TIM_CR1_CEN; (TIM2)->SR = ~TIM_FLAG_CC1; (TIM2)->DIER |= TIM_DIER_CC1IE;}
+static inline void IGN2_TIMER_ENABLE(void)  {(TIM2)->CR1 |= TIM_CR1_CEN; (TIM2)->SR = ~TIM_FLAG_CC2; (TIM2)->DIER |= TIM_DIER_CC2IE;}
+static inline void IGN3_TIMER_ENABLE(void)  {(TIM2)->CR1 |= TIM_CR1_CEN; (TIM2)->SR = ~TIM_FLAG_CC3; (TIM2)->DIER |= TIM_DIER_CC3IE;}
+static inline void IGN4_TIMER_ENABLE(void)  {(TIM2)->CR1 |= TIM_CR1_CEN; (TIM2)->SR = ~TIM_FLAG_CC4; (TIM2)->DIER |= TIM_DIER_CC4IE;}
+
+static inline void IGN1_TIMER_DISABLE(void)  {(TIM2)->DIER &= ~TIM_DIER_CC1IE;}
+static inline void IGN2_TIMER_DISABLE(void)  {(TIM2)->DIER &= ~TIM_DIER_CC2IE;}
+static inline void IGN3_TIMER_DISABLE(void)  {(TIM2)->DIER &= ~TIM_DIER_CC3IE;}
+static inline void IGN4_TIMER_DISABLE(void)  {(TIM2)->DIER &= ~TIM_DIER_CC4IE;}
+
+static inline void FUEL5_TIMER_ENABLE(void) {(TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->SR = ~TIM_FLAG_CC1; (TIM5)->DIER |= TIM_DIER_CC1IE;}
+static inline void FUEL6_TIMER_ENABLE(void) {(TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->SR = ~TIM_FLAG_CC2; (TIM5)->DIER |= TIM_DIER_CC2IE;}
+static inline void FUEL7_TIMER_ENABLE(void) {(TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->SR = ~TIM_FLAG_CC3; (TIM5)->DIER |= TIM_DIER_CC3IE;}
+static inline void FUEL8_TIMER_ENABLE(void) {(TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->CR1 |= TIM_CR1_CEN; (TIM5)->SR = ~TIM_FLAG_CC4; (TIM5)->DIER |= TIM_DIER_CC4IE;}
+
+static inline void FUEL5_TIMER_DISABLE(void) {(TIM5)->DIER &= ~TIM_DIER_CC1IE;}
+static inline void FUEL6_TIMER_DISABLE(void) {(TIM5)->DIER &= ~TIM_DIER_CC2IE;}
+static inline void FUEL7_TIMER_DISABLE(void) {(TIM5)->DIER &= ~TIM_DIER_CC3IE;}
+static inline void FUEL8_TIMER_DISABLE(void) {(TIM5)->DIER &= ~TIM_DIER_CC4IE;}
+
+static inline void IGN5_TIMER_ENABLE(void)  {(TIM4)->CR1 |= TIM_CR1_CEN; (TIM4)->SR = ~TIM_FLAG_CC1; (TIM4)->DIER |= TIM_DIER_CC1IE;}
+static inline void IGN6_TIMER_ENABLE(void)  {(TIM4)->CR1 |= TIM_CR1_CEN; (TIM4)->SR = ~TIM_FLAG_CC2; (TIM4)->DIER |= TIM_DIER_CC2IE;}
+static inline void IGN7_TIMER_ENABLE(void)  {(TIM4)->CR1 |= TIM_CR1_CEN; (TIM4)->SR = ~TIM_FLAG_CC3; (TIM4)->DIER |= TIM_DIER_CC3IE;}
+static inline void IGN8_TIMER_ENABLE(void)  {(TIM4)->CR1 |= TIM_CR1_CEN; (TIM4)->SR = ~TIM_FLAG_CC4; (TIM4)->DIER |= TIM_DIER_CC4IE;}
+
+static inline void IGN5_TIMER_DISABLE(void)  {(TIM4)->DIER &= ~TIM_DIER_CC1IE;}
+static inline void IGN6_TIMER_DISABLE(void)  {(TIM4)->DIER &= ~TIM_DIER_CC2IE;}
+static inline void IGN7_TIMER_DISABLE(void)  {(TIM4)->DIER &= ~TIM_DIER_CC3IE;}
+static inline void IGN8_TIMER_DISABLE(void)  {(TIM4)->DIER &= ~TIM_DIER_CC4IE;}
+
+
+/*
+***********************************************************************************************************
+* Auxiliaries
+*/
+#define ENABLE_BOOST_TIMER()  (TIM1)->SR = ~TIM_FLAG_CC2; (TIM1)->DIER |= TIM_DIER_CC2IE; (TIM1)->CR1 |= TIM_CR1_CEN;  
+#define DISABLE_BOOST_TIMER() (TIM1)->DIER &= ~TIM_DIER_CC2IE
+
+#define ENABLE_VVT_TIMER()    (TIM1)->SR = ~TIM_FLAG_CC3; (TIM1)->DIER |= TIM_DIER_CC3IE; (TIM1)->CR1 |= TIM_CR1_CEN;  
+#define DISABLE_VVT_TIMER()   (TIM1)->DIER &= ~TIM_DIER_CC3IE
+
+#define ENABLE_FAN_TIMER()  (TIM1)->SR = ~TIM_FLAG_CC1; (TIM1)->DIER |= TIM_DIER_CC1IE; (TIM1)->CR1 |= TIM_CR1_CEN;  
+#define DISABLE_FAN_TIMER() (TIM1)->DIER &= ~TIM_DIER_CC1IE
+
+#define BOOST_TIMER_COMPARE   (TIM1)->CCR2
+#define BOOST_TIMER_COUNTER   (TIM1)->CNT
+#define VVT_TIMER_COMPARE     (TIM1)->CCR3
+#define VVT_TIMER_COUNTER     (TIM1)->CNT
+#define FAN_TIMER_COMPARE     (TIM1)->CCR1
+#define FAN_TIMER_COUNTER     (TIM1)->CNT
+
+/*
+***********************************************************************************************************
+* Idle
+*/
+#define IDLE_COUNTER   (TIM1)->CNT
+#define IDLE_COMPARE   (TIM1)->CCR4
+
+#define IDLE_TIMER_ENABLE()  (TIM1)->SR = ~TIM_FLAG_CC4; (TIM1)->DIER |= TIM_DIER_CC4IE; (TIM1)->CR1 |= TIM_CR1_CEN;
+#define IDLE_TIMER_DISABLE() (TIM1)->DIER &= ~TIM_DIER_CC4IE
+
+
+/*
+***********************************************************************************************************
+* CAN / Second serial
+*/
+#if defined(HAL_CAN_MODULE_ENABLED)
+#define NATIVE_CAN_AVAILABLE
+#include <src/STM32_CAN/STM32_CAN.h>
+//This activates CAN1 interface on STM32, but it's named as Can0, because that's how Teensy implementation is done
+extern STM32_CAN Can0;
+#endif
+
+#if defined(STM32GENERIC) // STM32GENERIC core
+  #define SECONDARY_SERIAL_T SerialUART
+#else //libmaple core aka STM32DUINO
+  #define SECONDARY_SERIAL_T HardwareSerial
+#endif
+
+class inputPin_t;
+using boardInputPin_t = inputPin_t;
+class outputPin_t;
+using boardOutputPin_t = outputPin_t;
+
+/** @brief Analog pin mapping */
+#if NUM_ANALOG_INPUTS==10
+constexpr uint8_t ANALOG_PINS[NUM_ANALOG_INPUTS-1] = { _ANALOG_PINS_A0_A8  };
+#else
+constexpr uint8_t ANALOG_PINS[NUM_ANALOG_INPUTS-1] = { _ANALOG_PINS_A0_A14  };
+#endif
+
+/** @brief When the serial buffer is filled to greater than this threshold
+ * value, the serial processing operations will be performed more urgently 
+ * in order to avoid it overflowing. 
+ */
+constexpr uint8_t SERIAL_BUFFER_THRESHOLD = 0U;

@@ -1,0 +1,520 @@
+#include "board_definition.h"
+
+#if defined(STM32_CORE_VERSION_MAJOR)
+#include "auxiliaries.h"
+#include "idle.h"
+#include "HardwareTimer.h"
+#include "timers.h"
+#include "comms_secondary.h"
+#include "scheduler_ignition_controller.h"
+#include "scheduler_fuel_controller.h"
+
+#if defined(BOARD_FCR_MICRO_F4)
+extern "C" void __real_pinMode(uint8_t pin, uint8_t mode);
+extern "C" void __wrap_pinMode(uint8_t pin, uint8_t mode)
+{
+  if (pinIsReserved(pin)) { return; }
+  __real_pinMode(pin, mode);
+}
+
+__attribute__((constructor)) static void fcrInitFlashChipSelect(void)
+{
+  __real_pinMode((uint8_t)USE_SPI_EEPROM, OUTPUT);
+  digitalWrite((uint8_t)USE_SPI_EEPROM, HIGH);
+}
+
+// The stm32duino generic F429VITx variant ships an EMPTY (weak) SystemClock_Config(), so the chip
+// would run on the 16MHz High Speed Internal reset clock with no 48MHz USB clock and USB never enumerates.
+// Override it for the FCR Micro F4: 8MHz HSE -> 168MHz SYSCLK, PLLQ=7 -> 48MHz for USB FS.
+extern "C" void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM       = 8;    // 8MHz HSE / 8 = 1MHz PLL input
+  RCC_OscInitStruct.PLL.PLLN       = 336;  // 1MHz * 336 = 336MHz VCO
+  RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2; // 336/2 = 168MHz SYSCLK
+  RCC_OscInitStruct.PLL.PLLQ       = 7;    // 336/7 = 48MHz USB/SDIO clock
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                   | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1; // 168MHz AHB
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;   // 42MHz APB1 (max 45)
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;   // 84MHz APB2 (max 90)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) { Error_Handler(); }
+}
+#endif
+
+#if defined(SRAM_AS_EEPROM) // Use 4K battery backed SRAM, requires a 3V continuous source (like battery) connected to Vbat pin
+  #include "src/BackupSram/BackupSramAsEEPROM.h"
+  BackupSramAsEEPROM EEPROM;
+#elif defined(USE_SPI_EEPROM) // Use M25Qxx SPI flash on BlackF407VE
+  #include "src/SPIAsEEPROM/SPIAsEEPROM.h"
+    #if defined(STM32F407xx)
+      SPIClass SPI_for_flash(PB5, PB4, PB3); //SPI1_MOSI, SPI1_MISO, SPI1_SCK
+    #elif defined(BOARD_FCR_MICRO_F4)
+      SPIClass SPI_for_flash(PC12, PC11, PC10); //SPI3_MOSI, SPI3_MISO, SPI3_SCK (FCR Micro F4)
+    #else //Blue/Black Pills
+      SPIClass SPI_for_flash(PB15, PB14, PB13);
+    #endif
+ 
+    //winbond W25Q16 SPI flash EEPROM emulation
+    EEPROM_Emulation_Config EmulatedEEPROMMconfig{255UL, 4096UL, 31, 0x00100000UL};
+    Flash_SPI_Config SPIconfig{USE_SPI_EEPROM, SPI_for_flash};
+    SPI_EEPROM_Class EEPROM(EmulatedEEPROMMconfig, SPIconfig);
+#elif defined(FRAM_AS_EEPROM) // Use FRAM like FM25xxx, MB85RSxxx or any SPI compatible
+  #include "src/FRAM/Fram.h"
+  #if defined(STM32F407xx)
+    SPIClass SPI_for_FRAM(PB5, PB4, PB3); //SPI1_MOSI, SPI1_MISO, SPI1_SCK
+    FramClass EEPROM(PB0, SPI_for_FRAM);
+  #else //Blue/Black Pills
+    SPIClass SPI_for_FRAM(PB15, PB14, PB13);
+    FramClass EEPROM(PB12, SPI_for_FRAM);
+  #endif
+#else //default case, internal flash as EEPROM
+  #include "src/SPIAsEEPROM/SPIAsEEPROM.h"
+  #if defined(STM32F7xx)
+    #if defined(DUAL_BANK)
+      EEPROM_Emulation_Config EmulatedEEPROMMconfig{4UL, 131072UL, 2047UL, 0x08120000UL};
+    #else
+      EEPROM_Emulation_Config EmulatedEEPROMMconfig{2UL, 262144UL, 4095UL, 0x08180000UL};
+    #endif
+    InternalSTM32F7_EEPROM_Class EEPROM(EmulatedEEPROMMconfig);
+  #elif defined(STM32F401xC)
+    EEPROM_Emulation_Config EmulatedEEPROMMconfig{1UL, 131072UL, 4095UL, 0x08020000UL};
+    InternalSTM32F4_EEPROM_Class EEPROM(EmulatedEEPROMMconfig);
+  #elif defined(STM32F411xE)
+    EEPROM_Emulation_Config EmulatedEEPROMMconfig{2UL, 131072UL, 4095UL, 0x08040000UL};
+    InternalSTM32F4_EEPROM_Class EEPROM(EmulatedEEPROMMconfig);
+  #else //default case, internal flash as EEPROM for STM32F4
+    EEPROM_Emulation_Config EmulatedEEPROMMconfig{4UL, 131072UL, 2047UL, 0x08080000UL};
+    InternalSTM32F4_EEPROM_Class EEPROM(EmulatedEEPROMMconfig);
+  #endif
+#endif
+#include "board_eeprom_adapter.hpp"
+
+#if HAL_CAN_MODULE_ENABLED
+//This activates CAN1 interface on STM32, but it's named as Can0, because that's how Teensy implementation is done
+STM32_CAN Can0 (CAN1, ALT_2, RX_SIZE_256, TX_SIZE_16);
+/*
+These CAN interfaces and pins are available for use, depending on the chip/package:
+Default CAN1 pins are PA11 and PA12. Alternative (ALT) pins are PB8 & PB9 and ALT_2 pins are PD0 & PD1.
+Default CAN2 pins are PB12 & PB13. Alternative (ALT) pins are PB5 & PB6.
+Default CAN3 pins are PA8 & PA15. Alternative (ALT) pins are PB3 & PB4.
+*/
+#endif
+
+#if defined SD_LOGGING
+    SPIClass SD_SPI(PC12, PC11, PC10); //SPI3_MOSI, SPI3_MISO, SPI3_SCK
+#endif
+
+HardwareTimer Timer1(TIM1);
+HardwareTimer Timer2(TIM2);
+HardwareTimer Timer3(TIM3);
+HardwareTimer Timer4(TIM4);
+#if !defined(ARDUINO_BLUEPILL_F103C8) && !defined(ARDUINO_BLUEPILL_F103CB) //F103 just have 4 timers
+HardwareTimer Timer5(TIM5);
+#if defined(TIM11)
+HardwareTimer Timer11(TIM11);
+#elif defined(TIM7)
+HardwareTimer Timer11(TIM7);
+#endif
+#endif
+
+#ifdef RTC_ENABLED
+STM32RTC& rtc = STM32RTC::getInstance();
+#endif
+
+  /*
+  ***********************************************************************************************************
+  * Interrupt callback functions
+  */
+  #define IGNITION_INTERRUPT_NAME(index) CONCAT(CONCAT(ignitionSchedule, index), Interrupt)
+  #define FUEL_INTERRUPT_NAME(index) CONCAT(CONCAT(fuelSchedule, index), Interrupt)
+
+
+  #if ((STM32_CORE_VERSION_MINOR<=8) & (STM32_CORE_VERSION_MAJOR==1)) 
+  void oneMSInterval(HardwareTimer*){oneMSInterval();}
+  void boostInterrupt(HardwareTimer*){boostInterrupt();}
+  void idleInterrupt(HardwareTimer*){idleInterrupt();}
+  void vvtInterrupt(HardwareTimer*){vvtInterrupt();}
+  void fanInterrupt(HardwareTimer*){fanInterrupt();}
+  #define STM_FUEL_INTERRUPT(index) void FUEL_INTERRUPT_NAME(index)(HardwareTimer*) {moveToNextState(fuelSchedule ## index);}
+  #define STM_IGNITION_INTERRUPT(index) void IGNITION_INTERRUPT_NAME(index)(HardwareTimer*) {moveToNextState(ignitionSchedule ## index);}
+  #else //End core<=1.8
+  #define STM_FUEL_INTERRUPT(index) void FUEL_INTERRUPT_NAME(index)(void) {moveToNextState(fuelSchedule ## index);}
+  #define STM_IGNITION_INTERRUPT(index) void IGNITION_INTERRUPT_NAME(index)(void) {moveToNextState(ignitionSchedule ## index);}
+  #endif
+
+  STM_FUEL_INTERRUPT(1)
+  #if (INJ_CHANNELS >= 2)
+  STM_FUEL_INTERRUPT(2)
+  #endif
+  #if (INJ_CHANNELS >= 3)
+  STM_FUEL_INTERRUPT(3)
+  #endif
+  #if (INJ_CHANNELS >= 4)
+  STM_FUEL_INTERRUPT(4)
+  #endif
+  #if (INJ_CHANNELS >= 5)
+  STM_FUEL_INTERRUPT(5)
+  #endif
+  #if (INJ_CHANNELS >= 6)
+  STM_FUEL_INTERRUPT(6)
+  #endif
+  #if (INJ_CHANNELS >= 7)
+  STM_FUEL_INTERRUPT(7)
+  #endif
+  #if (INJ_CHANNELS >= 8)
+  STM_FUEL_INTERRUPT(8)
+  #endif
+
+  STM_IGNITION_INTERRUPT(1)
+  #if (IGN_CHANNELS >= 2)
+  STM_IGNITION_INTERRUPT(2)
+  #endif
+  #if (IGN_CHANNELS >= 3)
+  STM_IGNITION_INTERRUPT(3)
+  #endif
+  #if (IGN_CHANNELS >= 4)
+  STM_IGNITION_INTERRUPT(4)
+  #endif
+  #if (IGN_CHANNELS >= 5)
+  STM_IGNITION_INTERRUPT(5)
+  #endif
+  #if (IGN_CHANNELS >= 6)
+  STM_IGNITION_INTERRUPT(6)
+  #endif
+  #if (IGN_CHANNELS >= 7)
+  STM_IGNITION_INTERRUPT(7)
+  #endif
+  #if (IGN_CHANNELS >= 8)
+  STM_IGNITION_INTERRUPT(8)
+  #endif
+
+
+  void initBoard(uint32_t baudRate)
+  {
+    /*
+    ***********************************************************************************************************
+    * General
+    */
+    delay(10);
+
+    #ifndef HAVE_HWSERIAL2 //Hack to get the code to compile on BlackPills
+    #define Serial2 Serial1
+    #endif
+    pSecondarySerial = &Serial2;
+
+    /*
+    ***********************************************************************************************************
+    * Real Time clock for datalogging/time stamping
+    */
+    #ifdef RTC_ENABLED
+      //Check if RTC time has been set earlier. If yes, RTC will use LSE_CLOCK. If not, default LSI_CLOCK is used, to prevent hanging on boot.
+      if (rtc.isTimeSet()) {
+        rtc.setClockSource(STM32RTC::LSE_CLOCK); //Initialise external clock for RTC if clock is set. That is the only clock running of VBAT
+      }
+      rtc.begin(); // initialise RTC 24H format
+    #endif
+    /*
+    ***********************************************************************************************************
+    * Idle
+    */
+    if (isPwmIac(configPage6))
+    {
+        idle_pwm_max_count = (uint16_t)(MICROS_PER_SEC / (TIMER_RESOLUTION * configPage6.idleFreq * 2U)); //Converts the frequency in Hz to the number of ticks (at 4uS) it takes to complete 1 cycle. Note that the frequency is divided by 2 coming from TS to allow for up to 5KHz
+    } 
+
+    //This must happen at the end of the idle init
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer1.setMode(4, TIMER_OUTPUT_COMPARE);
+    #else
+    Timer1.setMode(4, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer1.attachInterrupt(4, idleInterrupt);  //on first flash the configPage4.iacAlgorithm is invalid
+
+
+    /*
+    ***********************************************************************************************************
+    * Timers
+    */
+    #if defined(ARDUINO_BLUEPILL_F103C8) || defined(ARDUINO_BLUEPILL_F103CB)
+      Timer4.setOverflow(1000, MICROSEC_FORMAT);  // Set up period
+      #if ( STM32_CORE_VERSION_MAJOR < 2 )
+      Timer4.setMode(1, TIMER_OUTPUT_COMPARE);
+      Timer4.attachInterrupt(1, oneMSInterval);
+      #else //2.0 forward
+      Timer4.attachInterrupt(oneMSInterval);
+      #endif
+      Timer4.resume(); //Start Timer
+    #else
+      Timer11.setOverflow(1000, MICROSEC_FORMAT);  // Set up period
+      #if ( STM32_CORE_VERSION_MAJOR < 2 )
+      Timer11.setMode(1, TIMER_OUTPUT_COMPARE);
+      Timer11.attachInterrupt(1, oneMSInterval);
+      #else
+      Timer11.attachInterrupt(oneMSInterval);
+      #endif
+      Timer11.resume(); //Start Timer
+    #endif
+    pinMode(LED_BUILTIN, OUTPUT); //Visual WDT
+
+    /*
+    ***********************************************************************************************************
+    * Auxiliaries
+    */
+    //2uS resolution Min 8Hz, Max 5KHz
+    boost_pwm_max_count = (uint16_t)(MICROS_PER_SEC / (TIMER_RESOLUTION * configPage6.boostFreq * 2U)); //Converts the frequency in Hz to the number of ticks (at 4uS) it takes to complete 1 cycle. The x2 is there because the frequency is stored at half value (in a byte) to allow frequencies up to 511Hz
+    vvt_pwm_max_count = (uint16_t)(MICROS_PER_SEC / (TIMER_RESOLUTION * configPage6.vvtFreq * 2U)); //Converts the frequency in Hz to the number of ticks (at 4uS) it takes to complete 1 cycle
+    fan_pwm_max_count = (uint16_t)(MICROS_PER_SEC / (TIMER_RESOLUTION * configPage6.fanFreq * 2U)); //Converts the frequency in Hz to the number of ticks (at 4uS) it takes to complete 1 cycle
+
+    //Need to be initialised last due to instant interrupt
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer1.setMode(1, TIMER_OUTPUT_COMPARE);
+    Timer1.setMode(2, TIMER_OUTPUT_COMPARE);
+    Timer1.setMode(3, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+	Timer1.setMode(1, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer1.setMode(2, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer1.setMode(3, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer1.attachInterrupt(1, fanInterrupt);
+    Timer1.attachInterrupt(2, boostInterrupt);
+    Timer1.attachInterrupt(3, vvtInterrupt);
+
+    /*
+    ***********************************************************************************************************
+    * Schedules
+    */
+    Timer1.setOverflow((numeric_limits<COMPARE_TYPE>::max)(), TICK_FORMAT);
+    Timer2.setOverflow((numeric_limits<COMPARE_TYPE>::max)(), TICK_FORMAT);
+    Timer3.setOverflow((numeric_limits<COMPARE_TYPE>::max)(), TICK_FORMAT);
+
+    Timer1.setPrescaleFactor(((Timer1.getTimerClkFreq()/1000000) * TIMER_RESOLUTION)-1);   //4us resolution
+    Timer2.setPrescaleFactor(((Timer2.getTimerClkFreq()/1000000) * TIMER_RESOLUTION)-1);   //4us resolution
+    Timer3.setPrescaleFactor(((Timer3.getTimerClkFreq()/1000000) * TIMER_RESOLUTION)-1);   //4us resolution
+
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer2.setMode(1, TIMER_OUTPUT_COMPARE);
+    Timer2.setMode(2, TIMER_OUTPUT_COMPARE);
+    Timer2.setMode(3, TIMER_OUTPUT_COMPARE);
+    Timer2.setMode(4, TIMER_OUTPUT_COMPARE);
+
+    Timer3.setMode(1, TIMER_OUTPUT_COMPARE);
+    Timer3.setMode(2, TIMER_OUTPUT_COMPARE);
+    Timer3.setMode(3, TIMER_OUTPUT_COMPARE);
+    Timer3.setMode(4, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer2.setMode(1, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer2.setMode(2, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer2.setMode(3, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer2.setMode(4, TIMER_OUTPUT_COMPARE_TOGGLE);
+
+    Timer3.setMode(1, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer3.setMode(2, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer3.setMode(3, TIMER_OUTPUT_COMPARE_TOGGLE);
+    Timer3.setMode(4, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    //Attach interrupt functions
+    //Injection
+    Timer3.attachInterrupt(1, FUEL_INTERRUPT_NAME(1));
+    #if (INJ_CHANNELS >= 2)
+    Timer3.attachInterrupt(2, FUEL_INTERRUPT_NAME(2));
+    #endif
+    #if (INJ_CHANNELS >= 3)
+    Timer3.attachInterrupt(3, FUEL_INTERRUPT_NAME(3));
+    #endif
+    #if (INJ_CHANNELS >= 4)
+    Timer3.attachInterrupt(4, FUEL_INTERRUPT_NAME(4));
+    #endif
+    #if (INJ_CHANNELS >= 5)
+    Timer5.setOverflow((numeric_limits<COMPARE_TYPE>::max)(), TICK_FORMAT);
+    Timer5.setPrescaleFactor(((Timer5.getTimerClkFreq()/1000000) * TIMER_RESOLUTION)-1);   //4us resolution
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer5.setMode(1, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer5.setMode(1, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer5.attachInterrupt(1, FUEL_INTERRUPT_NAME(5));
+    #endif
+    #if (INJ_CHANNELS >= 6)
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer5.setMode(2, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer5.setMode(2, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer5.attachInterrupt(2, FUEL_INTERRUPT_NAME(6));
+    #endif
+    #if (INJ_CHANNELS >= 7)
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer5.setMode(3, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer5.setMode(3, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer5.attachInterrupt(3, FUEL_INTERRUPT_NAME(7));
+    #endif
+    #if (INJ_CHANNELS >= 8)
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer5.setMode(4, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer5.setMode(4, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer5.attachInterrupt(4, FUEL_INTERRUPT_NAME(8));
+    #endif
+
+    //Ignition
+    Timer2.attachInterrupt(1, IGNITION_INTERRUPT_NAME(1)); 
+    #if (IGN_CHANNELS >= 2)
+    Timer2.attachInterrupt(2, IGNITION_INTERRUPT_NAME(2));
+    #endif
+    #if (IGN_CHANNELS >= 3)
+    Timer2.attachInterrupt(3, IGNITION_INTERRUPT_NAME(3));
+    #endif
+    #if (IGN_CHANNELS >= 4)
+    Timer2.attachInterrupt(4, IGNITION_INTERRUPT_NAME(4));
+    #endif
+    #if (IGN_CHANNELS >= 5)
+    Timer4.setOverflow((numeric_limits<COMPARE_TYPE>::max)(), TICK_FORMAT);
+    Timer4.setPrescaleFactor(((Timer4.getTimerClkFreq()/1000000) * TIMER_RESOLUTION)-1);   //4us resolution
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer4.setMode(1, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer4.setMode(1, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer4.attachInterrupt(1, IGNITION_INTERRUPT_NAME(5));
+    #endif
+    #if (IGN_CHANNELS >= 6)
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer4.setMode(2, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer4.setMode(2, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer4.attachInterrupt(2, IGNITION_INTERRUPT_NAME(6));
+    #endif
+    #if (IGN_CHANNELS >= 7)
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer4.setMode(3, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer4.setMode(3, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer4.attachInterrupt(3, IGNITION_INTERRUPT_NAME(7));
+    #endif
+    #if (IGN_CHANNELS >= 8)
+    #if ( STM32_CORE_VERSION_MAJOR < 2 )
+    Timer4.setMode(4, TIMER_OUTPUT_COMPARE);
+    #else //2.0 forward
+    Timer4.setMode(4, TIMER_OUTPUT_COMPARE_TOGGLE);
+    #endif
+    Timer4.attachInterrupt(4, IGNITION_INTERRUPT_NAME(8));
+    #endif
+
+    Serial.begin(baudRate);
+  }
+
+  uint16_t freeRam()
+  {
+    uint32_t freeRam = 0;
+    uint32_t stackTop = 0;
+    uint32_t heapTop = 0;
+
+    // current position of the stack.
+    stackTop = (uint32_t)&stackTop;
+
+    // current position of heap.
+    void *hTop = malloc(1);
+    heapTop = (uint32_t)hTop;
+    free(hTop);
+    freeRam = stackTop - heapTop;
+
+    return min((uint32_t)(numeric_limits<uint16_t>::max)(), freeRam);
+  }
+
+  void doSystemReset( void )
+  {
+    __disable_irq();
+    NVIC_SystemReset();
+  }
+
+  void jumpToBootloader( void ) // https://github.com/3devo/Arduino_Core_STM32/blob/jumpSysBL/libraries/SrcWrapper/src/stm32/bootloader.c
+  { // https://github.com/markusgritsch/SilF4ware/blob/master/SilF4ware/drv_reset.c
+    #if !defined(STM32F103xB)
+    HAL_RCC_DeInit();
+    HAL_DeInit();
+    SysTick->VAL = SysTick->LOAD = SysTick->CTRL = 0;
+    SYSCFG->MEMRMP = 0x01;
+
+    #if defined(STM32F7xx) || defined(STM32H7xx)
+    const uint32_t DFU_addr = 0x1FF00000; // From AN2606
+    #else
+    const uint32_t DFU_addr = 0x1FFF0000; // Default for STM32F10xxx and STM32F40xxx/STM32F41xxx from AN2606
+    #endif
+    // This is assembly to prevent modifying the stack pointer after
+    // loading it, and to ensure a jump (not call) to the bootloader.
+    // Not sure if the barriers are really needed, they were taken from
+    // https://github.com/GrumpyOldPizza/arduino-STM32L4/blob/ac659033eadd50cfe001ba1590a1362b2d87bb76/system/STM32L4xx/Source/boot_stm32l4xx.c#L159-L165
+    asm volatile (
+      "ldr r0, [%[DFU_addr], #0]   \n\t"  // get address of stack pointer
+      "msr msp, r0            \n\t"  // set stack pointer
+      "ldr r0, [%[DFU_addr], #4]   \n\t"  // get address of reset handler
+      "dsb                    \n\t"  // data sync barrier
+      "isb                    \n\t"  // instruction sync barrier
+      "bx r0                  \n\t"  // branch to bootloader
+      : : [DFU_addr] "l" (DFU_addr) : "r0"
+    );
+    __builtin_unreachable();
+    #endif
+  }
+
+
+uint8_t getSystemTemp(void)
+{
+  //stm32F4xx does have an internal temperature sensor, but needs to be implemented
+  return 0;
+}
+
+void boardInitRTC(void)
+{
+  // Do nothing
+}
+
+
+void boardInitPins(uint8_t)
+{
+  // Do nothing
+}
+
+static uint16_t getEepromWriteBlockSize(const statuses &current)
+{
+#if defined(USE_SPI_EEPROM)
+  //For use with common Winbond SPI EEPROMs Eg W25Q16JV
+  uint16_t maxWrite = 20; //This needs tuning
+#else
+  uint16_t maxWrite = 64;
+#endif
+
+  // Write to EEPROM more aggressively if the engine is not running
+  if(current.RPM==0U)
+  { 
+    return maxWrite * 8U;
+  } 
+
+  return maxWrite;
+}
+
+/** @brief Get the EEPROM storage API for the board */
+storage_api_t getBoardStorageApi(void)
+{
+  return getEEPROMStorageApi(getEepromWriteBlockSize);
+}
+
+#endif
