@@ -1,0 +1,910 @@
+#include <unity.h>
+#include "globals.h"
+#include "corrections.h"
+#include "../test_utils.h"
+#include "sensors.h"
+#include "units.h"
+
+extern int8_t correctionFixedTiming(int8_t advance);
+
+static void test_correctionFixedTiming_inactive(void) {
+    configPage2.fixAngEnable = 0;
+    configPage4.FixAng = 13;
+
+    TEST_ASSERT_EQUAL(8, correctionFixedTiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionFixedTiming(-3));
+}
+
+static void test_correctionFixedTiming_active(void) {
+    configPage2.fixAngEnable = 1;
+    configPage4.FixAng = 13;
+
+    TEST_ASSERT_EQUAL(configPage4.FixAng, correctionFixedTiming(8));
+    TEST_ASSERT_EQUAL(configPage4.FixAng, correctionFixedTiming(-3));
+}
+
+static void test_correctionFixedTiming(void) {
+    RUN_TEST_P(test_correctionFixedTiming_inactive);
+    RUN_TEST_P(test_correctionFixedTiming_active);
+}
+
+extern int8_t correctionCLTadvance(int8_t advance);
+extern table2D_u8_u8_6 CLTAdvanceTable; ///< 6 bin ignition adjustment based on coolant temperature  (2D)
+
+static void setup_clt_advance_table(void) {
+  initialiseCorrections();
+  currentStatus.LOOP_TIMER = 0;
+  BIT_SET(currentStatus.LOOP_TIMER, BIT_TIMER_4HZ);
+  TEST_DATA_P uint8_t bins[] = { 60, 70, 80, 90, 100, 110 };
+  TEST_DATA_P uint8_t values[] = { 30, 25, 20, 15, 10, 5 };
+  populate_2dtable_P(&CLTAdvanceTable, values, bins);
+}
+
+static void test_correctionCLTadvance_lookup(void) {
+    setup_clt_advance_table();
+
+    currentStatus.coolant = temperatureRemoveOffset(105);
+    TEST_ASSERT_EQUAL(8 + 8 - 15, correctionCLTadvance(8));
+
+    currentStatus.coolant = temperatureRemoveOffset(65);
+    TEST_ASSERT_EQUAL(1 + 28 - 15, correctionCLTadvance(1));
+
+    currentStatus.coolant = temperatureRemoveOffset(105);
+    TEST_ASSERT_EQUAL(-3 + 8 - 15, correctionCLTadvance(-3));
+}
+
+static void test_correctionCLTadvance(void) {
+    RUN_TEST_P(test_correctionCLTadvance_lookup);
+}
+
+static void test_correctionCrankingFixedTiming_nocrank_inactive(void) {
+    setup_clt_advance_table();
+    currentStatus.rotationStatus = EngineRotationStatus::Running;
+    configPage2.crkngAddCLTAdv = 0;
+    configPage4.CrankAng = 8;
+
+    TEST_ASSERT_EQUAL(-7, correctionCrankingFixedTiming(-7));
+}
+
+static void test_correctionCrankingFixedTiming_crank_fixed(void) {
+    setup_clt_advance_table();
+    currentStatus.rotationStatus = EngineRotationStatus::Cranking;
+    configPage2.crkngAddCLTAdv = 0;
+
+    configPage4.CrankAng = 8;
+    TEST_ASSERT_EQUAL(configPage4.CrankAng, correctionCrankingFixedTiming(-7));
+
+    configPage4.CrankAng = -8;
+    TEST_ASSERT_EQUAL(configPage4.CrankAng, correctionCrankingFixedTiming(-7));
+}
+
+static void test_correctionCrankingFixedTiming_crank_coolant(void) {
+    setup_clt_advance_table();
+    currentStatus.rotationStatus = EngineRotationStatus::Cranking;
+    configPage2.crkngAddCLTAdv = 1;
+    
+    configPage4.CrankAng = 8;
+
+    currentStatus.coolant = temperatureRemoveOffset(65);
+    TEST_ASSERT_EQUAL(1 + 28 - 15, correctionCLTadvance(1));
+}
+
+static void test_correctionCrankingFixedTiming(void) {
+    RUN_TEST_P(test_correctionCrankingFixedTiming_nocrank_inactive);
+    RUN_TEST_P(test_correctionCrankingFixedTiming_crank_fixed);
+    RUN_TEST_P(test_correctionCrankingFixedTiming_crank_coolant);
+}
+
+extern int8_t correctionFlexTiming(int8_t advance);
+extern table2D_u8_u8_6 flexAdvTable;   ///< 6 bin flex fuel correction table for timing advance (2D)
+
+static void setup_flexAdv(void) {
+  initialiseCorrections();
+  TEST_DATA_P uint8_t bins[] = { 30, 40, 50, 60, 70, 80 };
+  TEST_DATA_P uint8_t values[] = { 30, 25, 20, 15, 10, 5 };
+  populate_2dtable_P(&flexAdvTable, values, bins);
+
+  configPage2.flexEnabled = 1;
+  currentStatus.ethanolPct = 55;
+}
+
+static void test_correctionFlexTiming_inactive(void) {
+    setup_flexAdv();
+    configPage2.flexEnabled = 0;
+
+    TEST_ASSERT_EQUAL(-7, correctionFlexTiming(-7));
+    TEST_ASSERT_EQUAL(3, correctionFlexTiming(3));
+}
+
+static void test_correctionFlexTiming_table_lookup(void) {
+    setup_flexAdv();
+
+    TEST_ASSERT_EQUAL(IGNITION_ADVANCE_LARGE.toUser(8 + 18), correctionFlexTiming(8));
+    TEST_ASSERT_EQUAL(IGNITION_ADVANCE_LARGE.toUser(18), currentStatus.flexIgnCorrection);    
+
+    currentStatus.ethanolPct = 35;
+    TEST_ASSERT_EQUAL(IGNITION_ADVANCE_LARGE.toUser(-4 + 28), correctionFlexTiming(-4));
+    TEST_ASSERT_EQUAL(IGNITION_ADVANCE_LARGE.toUser(28), currentStatus.flexIgnCorrection);    
+}
+
+static void test_correctionFlexTiming(void) {
+    RUN_TEST_P(test_correctionFlexTiming_inactive);
+    RUN_TEST_P(test_correctionFlexTiming_table_lookup);
+}
+
+extern int8_t correctionWMITiming(int8_t advance);
+extern table2D_u8_u8_6 wmiAdvTable; //6 bin wmi correction table for timing advance (2D)
+
+static void setup_WMIAdv(void) {
+    initialiseCorrections();
+
+    configPage10.wmiEnabled= 1;
+    configPage10.wmiAdvEnabled = 1;
+    currentStatus.wmiTankEmpty = false;
+    configPage10.wmiTPS = 50;
+    currentStatus.TPS = configPage10.wmiTPS + 1;
+    configPage10.wmiRPM = 30;
+    currentStatus.setRpm( RPM_COARSE.toUser(configPage10.wmiRPM + 1U));
+    configPage10.wmiMAP = 35;
+    currentStatus.MAP = MAP.toUser(configPage10.wmiMAP+1L);
+    configPage10.wmiIAT = 155;
+    currentStatus.IAT = temperatureRemoveOffset(configPage10.wmiIAT) + 1;
+
+    TEST_DATA_P uint8_t bins[] = { 30, 40, 50, 60, 70, 80 };
+    TEST_DATA_P uint8_t values[] = { 30, 25, 20, 15, 10, 5 };
+    populate_2dtable_P(&wmiAdvTable, values, bins);
+}
+
+static void test_correctionWMITiming_table_lookup(void) {
+    setup_WMIAdv();
+
+    currentStatus.MAP = (55*2U)+1U;
+    TEST_ASSERT_EQUAL(IGNITION_ADVANCE_LARGE.toUser(8 + 18), correctionWMITiming(8));
+
+    currentStatus.MAP = (35*2U)+1U;
+    TEST_ASSERT_EQUAL(IGNITION_ADVANCE_LARGE.toUser(-4 + 28), correctionWMITiming(-4));
+}
+
+static void test_correctionWMITiming_wmidisabled_inactive(void) {
+    setup_WMIAdv();
+    configPage10.wmiEnabled= 0;
+
+    TEST_ASSERT_EQUAL(8, correctionWMITiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionWMITiming(-3));
+}
+
+
+static void test_correctionWMITiming_wmiadvdisabled_inactive(void) {
+    setup_WMIAdv();
+    configPage10.wmiAdvEnabled = 0;
+
+    TEST_ASSERT_EQUAL(8, correctionWMITiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionWMITiming(-3));
+}
+
+static void test_correctionWMITiming_empty_inactive(void) {
+    setup_WMIAdv();
+    currentStatus.wmiTankEmpty = true;
+
+    TEST_ASSERT_EQUAL(8, correctionWMITiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionWMITiming(-3));
+}
+
+static void test_correctionWMITiming_tpslow_inactive(void) {
+    setup_WMIAdv();
+    currentStatus.TPS = configPage10.wmiTPS - 1;
+
+    TEST_ASSERT_EQUAL(8, correctionWMITiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionWMITiming(-3));
+}
+
+static void test_correctionWMITiming_rpmlow_inactive(void) {
+    setup_WMIAdv();
+    currentStatus.setRpm( configPage10.wmiRPM - 1U);
+
+    TEST_ASSERT_EQUAL(8, correctionWMITiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionWMITiming(-3));
+}
+   
+static void test_correctionWMITiming_maplow_inactive(void) {
+    setup_WMIAdv();
+    currentStatus.MAP = (configPage10.wmiMAP*2)-1;
+
+    TEST_ASSERT_EQUAL(8, correctionWMITiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionWMITiming(-3));
+}
+    
+static void test_correctionWMITiming_iatlow_inactive(void) {
+    setup_WMIAdv();
+    currentStatus.IAT = temperatureRemoveOffset(configPage10.wmiIAT) - 1;
+
+    TEST_ASSERT_EQUAL(8, correctionWMITiming(8));
+    TEST_ASSERT_EQUAL(-3, correctionWMITiming(-3));
+}   
+
+static void test_correctionWMITiming(void) {
+    RUN_TEST_P(test_correctionWMITiming_table_lookup);
+    RUN_TEST_P(test_correctionWMITiming_tpslow_inactive);
+    RUN_TEST_P(test_correctionWMITiming_wmidisabled_inactive);
+    RUN_TEST_P(test_correctionWMITiming_wmiadvdisabled_inactive);
+    RUN_TEST_P(test_correctionWMITiming_empty_inactive);
+    RUN_TEST_P(test_correctionWMITiming_tpslow_inactive);
+    RUN_TEST_P(test_correctionWMITiming_rpmlow_inactive);
+    RUN_TEST_P(test_correctionWMITiming_maplow_inactive);
+    RUN_TEST_P(test_correctionWMITiming_iatlow_inactive);
+}
+
+extern int8_t correctionIATretard(int8_t advance);
+extern table2D_u8_u8_6 IATRetardTable; ///< 6 bin ignition adjustment based on inlet air temperature  (2D)
+
+static void setup_IATRetard(void) {
+  initialiseCorrections();
+  currentStatus.LOOP_TIMER = 0;
+  BIT_SET(currentStatus.LOOP_TIMER, IAT_READ_TIMER_BIT);
+  TEST_DATA_P uint8_t bins[] = { 30, 40, 50, 60, 70, 80 };
+  TEST_DATA_P uint8_t values[] = { 30, 25, 20, 15, 10, 5 };
+  populate_2dtable_P(&IATRetardTable, values, bins);
+
+  currentStatus.IAT = 75;
+}
+
+static void test_correctionIATretard_table_lookup(void) {
+    setup_IATRetard();
+
+    currentStatus.IAT = 75;
+    TEST_ASSERT_EQUAL(-11-8, correctionIATretard(-11));
+
+    currentStatus.IAT = 45;
+    TEST_ASSERT_EQUAL(-11-23, correctionIATretard(-11));
+}
+
+static void test_correctionIATretard(void) {
+    RUN_TEST_P(test_correctionIATretard_table_lookup);
+}
+
+extern int8_t correctionIdleAdvance(int8_t advance);
+
+static void setup_idleadv_tps(void) {
+    configPage2.idleAdvAlgorithm = IDLEADVANCE_ALGO_TPS;
+    configPage2.idleAdvTPS = 30;
+    currentStatus.TPS = configPage2.idleAdvTPS - 1U;
+}
+
+static void setup_idleadv_ctps(void) {
+    configPage2.idleAdvAlgorithm = IDLEADVANCE_ALGO_CTPS;
+    currentStatus.CTPSActive = 1;
+}
+
+extern table2D_u8_u8_6 idleAdvanceTable; ///< 6 bin idle advance adjustment table based on RPM difference  (2D)
+
+static void setup_correctionIdleAdvance(void) {
+    initialiseCorrections();
+
+    TEST_DATA_P uint8_t bins[] = { 30, 40, 50, 60, 70, 80 };
+    TEST_DATA_P uint8_t values[] = { 30, 25, 20, 15, 10, 5 };
+    populate_2dtable_P(&idleAdvanceTable, values, bins);
+  
+    configPage2.idleAdvEnabled = IDLEADVANCE_MODE_ADDED;
+    configPage2.idleAdvDelay = 5;
+    configPage2.idleAdvRPM = 20;
+    configPage2.vssMode = VSS_MODE_OFF;
+    configPage6.iacAlgorithm = IAC_ALGORITHM_NONE;
+    configPage9.idleAdvStartDelay = 0U;
+
+    runSecsX10 = configPage2.idleAdvDelay * 5;
+    currentStatus.rotationStatus = EngineRotationStatus::Running;
+    // int idleRPMdelta = (currentStatus.CLIdleTarget - (currentStatus.RPM / 10) ) + 50;
+    currentStatus.CLIdleTarget = 100;
+    currentStatus.setRpm( (configPage2.idleAdvRPM * 100U) - 1U);
+    
+    setup_idleadv_tps();
+    // Run once to initialise internal state
+    correctionIdleAdvance(8);
+}
+
+static void assert_correctionIdleAdvance(int8_t advance, uint8_t expectedLookupValue) {
+    configPage2.idleAdvEnabled = IDLEADVANCE_MODE_ADDED;
+    TEST_ASSERT_EQUAL(advance + expectedLookupValue - 15, correctionIdleAdvance(advance));
+
+    configPage2.idleAdvEnabled = IDLEADVANCE_MODE_SWITCHED;
+    TEST_ASSERT_EQUAL(expectedLookupValue - 15, correctionIdleAdvance(advance));
+}
+
+static void test_correctionIdleAdvance_tps_lookup_nodelay(void) {
+    setup_correctionIdleAdvance();
+
+    setup_idleadv_tps();
+
+    currentStatus.setRpm( (currentStatus.CLIdleTarget * 10U) + 100U);
+    assert_correctionIdleAdvance(8, 25);
+
+    currentStatus.setRpm( (currentStatus.CLIdleTarget * 10U) - 100U);
+    assert_correctionIdleAdvance(-3, 15);
+}
+
+static void test_correctionIdleAdvance_ctps_lookup_nodelay(void) {
+    setup_correctionIdleAdvance();
+
+    setup_idleadv_ctps();
+
+    currentStatus.setRpm( (currentStatus.CLIdleTarget * 10) + 100);
+    assert_correctionIdleAdvance(8, 25);
+
+    currentStatus.setRpm( (currentStatus.CLIdleTarget * 10) - 100);
+    assert_correctionIdleAdvance(-3, 15);
+}
+
+static void test_correctionIdleAdvance_inactive_notrunning(void) {
+    setup_correctionIdleAdvance();
+    
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+    currentStatus.rotationStatus = EngineRotationStatus::Stopped;
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance_noadvance_modeoff(void) {
+    setup_correctionIdleAdvance();
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+    configPage2.idleAdvEnabled = IDLEADVANCE_MODE_OFF;
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance_noadvance_rpmtoohigh(void) {
+    setup_correctionIdleAdvance();
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+    currentStatus.setRpm( (configPage2.idleAdvRPM * 100)+1);
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance_noadvance_vsslimit(void) {
+    setup_correctionIdleAdvance();
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+    configPage2.vssMode = VSS_MODE_INTERNAL_PIN;
+    configPage2.idleAdvVss = 15;
+    currentStatus.vss = configPage2.idleAdvVss + 1;
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance_noadvance_tpslimit(void) {
+    setup_correctionIdleAdvance();
+    setup_idleadv_tps();
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+    currentStatus.TPS = configPage2.idleAdvTPS + 1U;
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance_noadvance_ctpsinactive(void) {
+    setup_correctionIdleAdvance();
+    setup_idleadv_ctps();
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+    currentStatus.CTPSActive = 0;
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance_noadvance_rundelay(void) {
+    setup_correctionIdleAdvance();
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+    runSecsX10 = (configPage2.idleAdvDelay * 5)-1;
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance_delay(void) {
+    setup_correctionIdleAdvance();
+    configPage9.idleAdvStartDelay = 3;
+    BIT_SET(currentStatus.LOOP_TIMER, BIT_TIMER_10HZ);
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+    TEST_ASSERT_EQUAL(8, correctionIdleAdvance(8));
+    TEST_ASSERT_EQUAL(23, correctionIdleAdvance(8));
+}
+
+static void test_correctionIdleAdvance(void) {
+    RUN_TEST_P(test_correctionIdleAdvance_tps_lookup_nodelay);
+    RUN_TEST_P(test_correctionIdleAdvance_ctps_lookup_nodelay);
+    RUN_TEST_P(test_correctionIdleAdvance_inactive_notrunning);
+    RUN_TEST_P(test_correctionIdleAdvance_noadvance_modeoff);
+    RUN_TEST_P(test_correctionIdleAdvance_noadvance_rpmtoohigh);
+    RUN_TEST_P(test_correctionIdleAdvance_noadvance_vsslimit);
+    RUN_TEST_P(test_correctionIdleAdvance_noadvance_tpslimit);
+    RUN_TEST_P(test_correctionIdleAdvance_noadvance_ctpsinactive);
+    RUN_TEST_P(test_correctionIdleAdvance_noadvance_rundelay);
+    RUN_TEST_P(test_correctionIdleAdvance_delay);
+}
+
+extern int8_t correctionSoftRevLimit(int8_t advance);
+
+static void setup_correctionSoftRevLimit(void) {
+    initialiseCorrections();
+
+    configPage6.engineProtectType = PROTECT_CUT_IGN;
+    configPage4.SoftRevLim = 50;
+    configPage4.SoftLimMax = 1;
+    configPage4.SoftLimRetard = 5;
+    configPage2.SoftLimitMode = SOFT_LIMIT_FIXED;
+
+    currentStatus.setRpm( (configPage4.SoftRevLim + 1U)*100U);
+    softLimitTime = 0;
+
+    BIT_CLEAR(currentStatus.LOOP_TIMER, BIT_TIMER_10HZ);
+}
+
+static void assert_correctionSoftRevLimit(int8_t advance) {
+    configPage2.SoftLimitMode = SOFT_LIMIT_FIXED;
+    TEST_ASSERT_EQUAL(configPage4.SoftLimRetard, correctionSoftRevLimit(advance));
+    TEST_ASSERT_TRUE(currentStatus.softLimitActive);
+
+    currentStatus.softLimitActive = false;
+    configPage2.SoftLimitMode = SOFT_LIMIT_RELATIVE;
+    TEST_ASSERT_EQUAL(advance-configPage4.SoftLimRetard, correctionSoftRevLimit(advance));
+    TEST_ASSERT_TRUE(currentStatus.softLimitActive);
+}
+
+static void test_correctionSoftRevLimit_modes(void) {
+    setup_correctionSoftRevLimit();
+
+    assert_correctionSoftRevLimit(8);
+    assert_correctionSoftRevLimit(-3);
+}
+
+static void test_correctionSoftRevLimit_inactive_protecttype(void) {
+    setup_correctionSoftRevLimit();
+
+    configPage6.engineProtectType = PROTECT_CUT_OFF;
+    currentStatus.softLimitActive = true;
+    TEST_ASSERT_EQUAL(8, correctionSoftRevLimit(8));
+    TEST_ASSERT_FALSE(currentStatus.softLimitActive);
+
+    configPage6.engineProtectType = PROTECT_CUT_FUEL;
+    currentStatus.softLimitActive = true;
+    TEST_ASSERT_EQUAL(8, correctionSoftRevLimit(8));
+    TEST_ASSERT_FALSE(currentStatus.softLimitActive);
+}
+
+static void test_correctionSoftRevLimit_inactive_rpmtoohigh(void) {
+    setup_correctionSoftRevLimit();
+    assert_correctionSoftRevLimit(8);
+
+    currentStatus.setRpm( (configPage4.SoftRevLim - 1U)*100U);
+    currentStatus.softLimitActive = true;
+    TEST_ASSERT_EQUAL(8, correctionSoftRevLimit(8));
+    TEST_ASSERT_FALSE(currentStatus.softLimitActive);
+}
+
+static void test_correctionSoftRevLimit_timeout(void) {
+    setup_correctionSoftRevLimit();
+
+    configPage4.SoftLimMax = 3;
+    configPage2.SoftLimitMode = SOFT_LIMIT_RELATIVE;
+    BIT_SET(currentStatus.LOOP_TIMER, BIT_TIMER_10HZ);
+    TEST_ASSERT_EQUAL(8-configPage4.SoftLimRetard, correctionSoftRevLimit(8));
+    TEST_ASSERT_EQUAL(-5-configPage4.SoftLimRetard, correctionSoftRevLimit(-5));
+    TEST_ASSERT_EQUAL(23-configPage4.SoftLimRetard, correctionSoftRevLimit(23));
+    TEST_ASSERT_EQUAL(-21, correctionSoftRevLimit(-21));
+    TEST_ASSERT_EQUAL(8, correctionSoftRevLimit(8));
+    TEST_ASSERT_EQUAL(0, correctionSoftRevLimit(0));
+}
+
+static void test_correctionSoftRevLimit(void) {
+    RUN_TEST_P(test_correctionSoftRevLimit_modes);
+    RUN_TEST_P(test_correctionSoftRevLimit_inactive_protecttype);
+    RUN_TEST_P(test_correctionSoftRevLimit_inactive_rpmtoohigh);
+    RUN_TEST_P(test_correctionSoftRevLimit_timeout);
+}
+
+extern int8_t correctionNitrous(int8_t advance);
+
+static void test_correctionNitrous_disabled(void) {
+    configPage10.n2o_enable = 0;
+    TEST_ASSERT_EQUAL(13, correctionNitrous(13));
+    TEST_ASSERT_EQUAL(-13, correctionNitrous(-13));
+}
+
+static void test_correctionNitrous_stage1(void) {
+    configPage10.n2o_enable = 1;
+    configPage10.n2o_stage1_retard = 5;
+    configPage10.n2o_stage2_retard = 0;
+    
+    currentStatus.nitrous_status = NITROUS_STAGE1;
+    TEST_ASSERT_EQUAL(8, correctionNitrous(13));
+    TEST_ASSERT_EQUAL(-18, correctionNitrous(-13));
+    
+    currentStatus.nitrous_status = NITROUS_BOTH;
+    TEST_ASSERT_EQUAL(8, correctionNitrous(13));
+    TEST_ASSERT_EQUAL(-18, correctionNitrous(-13));
+}
+
+static void test_correctionNitrous_stage2(void) {
+    configPage10.n2o_enable = 1;
+    configPage10.n2o_stage1_retard = 0;
+    configPage10.n2o_stage2_retard = 5;
+    
+    currentStatus.nitrous_status = NITROUS_STAGE2;
+    TEST_ASSERT_EQUAL(8, correctionNitrous(13));
+    TEST_ASSERT_EQUAL(-18, correctionNitrous(-13));
+    
+    currentStatus.nitrous_status = NITROUS_BOTH;
+    TEST_ASSERT_EQUAL(8, correctionNitrous(13));
+    TEST_ASSERT_EQUAL(-18, correctionNitrous(-13));
+}
+
+static void test_correctionNitrous_stageboth(void) {
+    configPage10.n2o_enable = 1;
+    configPage10.n2o_stage1_retard = 3;
+    configPage10.n2o_stage2_retard = 5;
+      
+    currentStatus.nitrous_status = NITROUS_BOTH;
+    TEST_ASSERT_EQUAL(5, correctionNitrous(13));
+    TEST_ASSERT_EQUAL(-21, correctionNitrous(-13));
+}
+
+static void test_correctionNitrous(void) {
+    RUN_TEST_P(test_correctionNitrous_disabled);
+    RUN_TEST_P(test_correctionNitrous_stage1);
+    RUN_TEST_P(test_correctionNitrous_stage2);
+    RUN_TEST_P(test_correctionNitrous_stageboth);
+}
+
+extern int8_t correctionSoftLaunch(int8_t advance);
+
+static void setup_correctionSoftLaunch(void) {
+    configPage6.launchEnabled = 1;
+    configPage6.flatSArm = 20;
+    configPage6.lnchSoftLim = 40;
+    configPage10.lnchCtrlTPS = 80;
+    configPage10.lnchCtrlVss = 50;
+    configPage2.vssMode = 2;
+    
+    currentStatus.clutchTrigger = 1;
+    currentStatus.clutchEngagedRPM = ((configPage6.flatSArm) * 100) - 100;
+    currentStatus.setRpm( ((configPage6.lnchSoftLim) * 100) + 100);
+    currentStatus.TPS = configPage10.lnchCtrlTPS + 1;
+    currentStatus.vss = 30;
+}
+
+static void test_correctionSoftLaunch_on(void) {
+    setup_correctionSoftLaunch();
+
+    configPage6.lnchRetard = -3;
+    TEST_ASSERT_EQUAL(configPage6.lnchRetard, correctionSoftLaunch(-8));
+    TEST_ASSERT_TRUE(currentStatus.launchingSoft);
+    TEST_ASSERT_TRUE(currentStatus.softLaunchActive);
+
+    configPage6.lnchRetard = 3;
+    currentStatus.launchingSoft = false;
+    currentStatus.softLaunchActive = false;
+    TEST_ASSERT_EQUAL(configPage6.lnchRetard, correctionSoftLaunch(8));
+    TEST_ASSERT_TRUE(currentStatus.launchingSoft);
+    TEST_ASSERT_TRUE(currentStatus.softLaunchActive);
+}
+
+static void test_correctionSoftLaunch_off_disabled(void) {
+    setup_correctionSoftLaunch();
+    configPage6.launchEnabled = 0;
+    configPage6.lnchRetard = -3;
+
+    TEST_ASSERT_EQUAL(-8, correctionSoftLaunch(-8));
+    TEST_ASSERT_FALSE(currentStatus.launchingSoft);
+    TEST_ASSERT_FALSE(currentStatus.softLaunchActive);
+}
+
+static void test_correctionSoftLaunch_off_noclutchtrigger(void) {
+    setup_correctionSoftLaunch();
+    currentStatus.clutchTrigger = 0;
+    configPage6.lnchRetard = -3;
+
+    TEST_ASSERT_EQUAL(-8, correctionSoftLaunch(-8));
+    TEST_ASSERT_FALSE(currentStatus.launchingSoft);
+    TEST_ASSERT_FALSE(currentStatus.softLaunchActive);
+}
+
+static void test_correctionSoftLaunch_off_clutchrpmlow(void) {
+    setup_correctionSoftLaunch();
+    currentStatus.clutchEngagedRPM = (configPage6.flatSArm * 100) + 1;
+    configPage6.lnchRetard = -3;
+
+    TEST_ASSERT_EQUAL(-8, correctionSoftLaunch(-8));
+    TEST_ASSERT_FALSE(currentStatus.launchingSoft);
+    TEST_ASSERT_FALSE(currentStatus.softLaunchActive);
+}
+
+static void test_correctionSoftLaunch_off_rpmlimit(void) {
+    setup_correctionSoftLaunch();
+    currentStatus.setRpm( (configPage6.lnchSoftLim * 100) - 1);
+    configPage6.lnchRetard = -3;
+
+    TEST_ASSERT_EQUAL(-8, correctionSoftLaunch(-8));
+    TEST_ASSERT_FALSE(currentStatus.launchingSoft);
+    TEST_ASSERT_FALSE(currentStatus.softLaunchActive);
+}
+
+static void test_correctionSoftLaunch_off_tpslow(void) {
+    setup_correctionSoftLaunch();
+    currentStatus.TPS = configPage10.lnchCtrlTPS - 1;
+    configPage6.lnchRetard = -3;
+
+    TEST_ASSERT_EQUAL(-8, correctionSoftLaunch(-8));
+    TEST_ASSERT_FALSE(currentStatus.launchingSoft);
+    TEST_ASSERT_FALSE(currentStatus.softLaunchActive);
+}
+
+static void test_correctionSoftLaunch_off_vsslimit(void) {
+    setup_correctionSoftLaunch();
+    currentStatus.vss = 100; //VSS above limit of 80
+
+    TEST_ASSERT_EQUAL(-8, correctionSoftLaunch(-8));
+    TEST_ASSERT_FALSE(currentStatus.launchingSoft);
+    TEST_ASSERT_FALSE(currentStatus.softLaunchActive);
+}
+
+static void test_correctionSoftLaunch(void) {
+    RUN_TEST_P(test_correctionSoftLaunch_on);
+    RUN_TEST_P(test_correctionSoftLaunch_off_disabled);
+    RUN_TEST_P(test_correctionSoftLaunch_off_noclutchtrigger);
+    RUN_TEST_P(test_correctionSoftLaunch_off_clutchrpmlow);
+    RUN_TEST_P(test_correctionSoftLaunch_off_rpmlimit);
+    RUN_TEST_P(test_correctionSoftLaunch_off_tpslow);
+    RUN_TEST_P(test_correctionSoftLaunch_off_vsslimit);
+}
+
+extern int8_t correctionSoftFlatShift(int8_t advance);
+
+static void setup_correctionSoftFlatShift(void) {
+    configPage6.flatSEnable = 1;
+    configPage6.flatSArm = 10;
+    configPage6.flatSSoftWin = 10;
+    
+    currentStatus.clutchTrigger = 1;
+    currentStatus.clutchEngagedRPM = ((configPage6.flatSArm) * 100) + 500;
+    currentStatus.setRpm( currentStatus.clutchEngagedRPM + 600);
+
+    currentStatus.flatShiftSoftCut = false;
+}
+
+static void test_correctionSoftFlatShift_on(void) {
+    setup_correctionSoftFlatShift();
+    configPage6.flatSRetard = -3;
+
+    TEST_ASSERT_EQUAL(configPage6.flatSRetard, correctionSoftFlatShift(-8));
+    TEST_ASSERT_TRUE(currentStatus.flatShiftSoftCut);
+
+    currentStatus.flatShiftSoftCut = false;
+    TEST_ASSERT_EQUAL(configPage6.flatSRetard, correctionSoftFlatShift(3));
+    TEST_ASSERT_TRUE(currentStatus.flatShiftSoftCut);
+}
+
+static void test_correctionSoftFlatShift_off_disabled(void) {
+    setup_correctionSoftFlatShift();
+    configPage6.flatSRetard = -3;
+    configPage6.flatSEnable = 0;
+
+    currentStatus.flatShiftSoftCut = true;
+    TEST_ASSERT_EQUAL(-8, correctionSoftFlatShift(-8));
+    TEST_ASSERT_FALSE(currentStatus.flatShiftSoftCut);
+}
+
+static void test_correctionSoftFlatShift_off_noclutchtrigger(void) {
+    setup_correctionSoftFlatShift();
+    configPage6.flatSRetard = -3;
+    currentStatus.clutchTrigger = 0;
+
+    currentStatus.flatShiftSoftCut = true;
+    TEST_ASSERT_EQUAL(-8, correctionSoftFlatShift(-8));
+    TEST_ASSERT_FALSE(currentStatus.flatShiftSoftCut);
+}
+
+static void test_correctionSoftFlatShift_off_clutchrpmtoolow(void) {
+    setup_correctionSoftFlatShift();
+    configPage6.flatSRetard = -3;
+    currentStatus.clutchEngagedRPM = ((configPage6.flatSArm) * 100) - 500;
+
+    currentStatus.flatShiftSoftCut = true;
+    TEST_ASSERT_EQUAL(-8, correctionSoftFlatShift(-8));
+    TEST_ASSERT_FALSE(currentStatus.flatShiftSoftCut);
+}
+
+static void test_correctionSoftFlatShift_off_rpmnotinwindow(void) {
+    setup_correctionSoftFlatShift();
+    configPage6.flatSRetard = -3;
+    currentStatus.setRpm( (currentStatus.clutchEngagedRPM - (configPage6.flatSSoftWin * 100) ) - 100);
+
+    currentStatus.flatShiftSoftCut = true;
+    TEST_ASSERT_EQUAL(-8, correctionSoftFlatShift(-8));
+    TEST_ASSERT_FALSE(currentStatus.flatShiftSoftCut);
+}
+
+static void test_correctionSoftFlatShift(void) {
+    RUN_TEST_P(test_correctionSoftFlatShift_on);
+    RUN_TEST_P(test_correctionSoftFlatShift_off_disabled);
+    RUN_TEST_P(test_correctionSoftFlatShift_off_noclutchtrigger);
+    RUN_TEST_P(test_correctionSoftFlatShift_off_clutchrpmtoolow);
+    RUN_TEST_P(test_correctionSoftFlatShift_off_rpmnotinwindow);
+}
+
+#if 0 // Wait until Noisymime is done with knock implementation
+extern int8_t correctionKnock(int8_t advance);
+
+static void setup_correctionKnock(void) {
+    configPage10.knock_mode = KNOCK_MODE_DIGITAL;
+    configPage10.knock_count = 5U;
+    configPage10.knock_firstStep = 3U;
+    // knockCounter = configPage10.knock_count + 1;
+//   TEST_DATA_P uint8_t startBins[] = { 30, 40, 50, 60, 70, 80 };
+//   TEST_DATA_P uint8_t startValues[] = { 30, 25, 20, 15, 10, 5 };
+//   populate_2dtable_P(&knockWindowStartTable, startValues, startBins);
+
+//   TEST_DATA_P uint8_t durationBins[] = { 30, 40, 50, 60, 70, 80 };
+//   TEST_DATA_P uint8_t durationValues[] = { 30, 25, 20, 15, 10, 5 };
+//   populate_2dtable_P(&knockWindowDurationTable, durationValues, durationBins);
+}
+
+static void test_correctionKnock_firstStep(void) {
+    setup_correctionKnock();
+
+    TEST_ASSERT_EQUAL(-11, correctionKnock(-8));
+}
+
+static void test_correctionKnock_disabled_modeoff(void) {
+    setup_correctionKnock();
+    configPage10.knock_mode = KNOCK_MODE_OFF;
+    TEST_ASSERT_EQUAL(-8, correctionKnock(-8));
+}
+
+static void test_correctionKnock_disabled_counttoolow(void) {
+    setup_correctionKnock();
+    knockCounter = configPage10.knock_count - 1;
+    TEST_ASSERT_EQUAL(-8, correctionKnock(-8));
+}
+
+static void test_correctionKnock_disabled_knockactive(void) {
+    setup_correctionKnock();
+    currentStatus.knockActive = true;
+    TEST_ASSERT_EQUAL(-8, correctionKnock(-8));
+}
+#endif
+
+static void test_correctionKnock(void) {
+}
+
+extern table2D_u8_u8_6 dwellVCorrectionTable; ///< 6 bin dwell voltage correction (2D)
+
+static void setup_correctionsDwell(void) {
+    initialiseCorrections();
+    BIT_SET(currentStatus.LOOP_TIMER, BIT_TIMER_4HZ);
+
+    configPage4.sparkDur = 10;
+    configPage2.perToothIgn = false;
+    configPage4.dwellErrCorrect = 0;
+    configPage4.sparkMode = IGN_MODE_WASTED;
+
+    currentStatus.actualDwell = 770;
+    currentStatus.battery10 = 95;
+
+    currentStatus.revolutionTime = 666;
+
+    TEST_DATA_P uint8_t bins[] = { 60,  70,  80,  90,  100, 110 };
+    TEST_DATA_P uint8_t values[] = { 130, 125, 120, 115, 110, 90 };
+    populate_2dtable_P(&dwellVCorrectionTable, values, bins);   
+}
+
+extern uint16_t correctDwellClosedLoop(uint16_t computedDwell, uint16_t actualDwell);
+
+static void test_correctDwellClosedLoop_nochange(void) {
+    TEST_ASSERT_EQUAL(1000U, correctDwellClosedLoop(1000U, 1000U));
+}
+
+static void test_correctDwellClosedLoop_smallError(void) {
+    // computed 1000, actual 900 -> error 100 -> returned 1100
+    TEST_ASSERT_EQUAL(1100U, correctDwellClosedLoop(1000U, 900U));
+}
+
+static void test_correctDwellClosedLoop_largeError(void) {
+    // computed 1000, actual 400 -> error 600 > 500 -> doubled to 1200 -> returned 2200
+    TEST_ASSERT_EQUAL(2200U, correctDwellClosedLoop(1000U, 400U));
+}
+
+static void test_correctDwellClosedLoop_clipComputed(void) {
+    // computed value greater than INT16_MAX should be clipped to 32767
+    TEST_ASSERT_EQUAL(32767U, correctDwellClosedLoop(40000U, 40000U));
+}
+
+static void test_correctDwellClosedLoop_actualGreater(void) {
+    // actual value greater than computed value should increase computed value
+    TEST_ASSERT_EQUAL(6600U, correctDwellClosedLoop(6600U, 8800U));
+}
+
+static void test_correctionsDwell_nopertooth(void) {
+    setup_correctionsDwell();
+
+    currentStatus.battery10 = 105;
+    configPage2.nCylinders = 8;
+
+    configPage4.sparkMode = IGN_MODE_WASTED;
+    TEST_ASSERT_EQUAL(296, correctionsDwell(800));
+
+    configPage4.sparkMode = IGN_MODE_SINGLE;
+    TEST_ASSERT_EQUAL(74, correctionsDwell(800));
+
+    configPage4.sparkMode = IGN_MODE_ROTARY;
+    configPage10.rotaryType = ROTARY_IGN_RX8;
+    TEST_ASSERT_EQUAL(296, correctionsDwell(800));
+
+    configPage4.sparkMode = IGN_MODE_ROTARY;
+    configPage10.rotaryType = ROTARY_IGN_FC;
+    TEST_ASSERT_EQUAL(74, correctionsDwell(800));
+}
+
+static void test_correctionsDwell_pertooth(void) {
+    setup_correctionsDwell();
+
+    currentStatus.battery10 = 105;
+    configPage2.perToothIgn = true;
+    configPage4.dwellErrCorrect = 1;
+    configPage4.sparkMode = IGN_MODE_WASTED;
+
+    currentStatus.actualDwell = 200;
+    TEST_ASSERT_EQUAL(444, correctionsDwell(800));
+
+    currentStatus.actualDwell = 1400;
+    TEST_ASSERT_EQUAL(296, correctionsDwell(800));
+}
+
+static void test_correctionsDwell_wasted_nopertooth_largerevolutiontime(void) {
+    setup_correctionsDwell();
+
+    currentStatus.battery10 = 105;
+    currentStatus.revolutionTime = 5000;
+    TEST_ASSERT_EQUAL(800, correctionsDwell(800));
+}
+
+static void test_correctionsDwell_initialises_current_actualDwell(void) {
+    setup_correctionsDwell();
+
+    currentStatus.actualDwell = 0;
+    correctionsDwell(777);
+    TEST_ASSERT_EQUAL(777, currentStatus.actualDwell);
+}
+
+static void test_correctionsDwell_uses_batvcorrection(void) {
+    setup_correctionsDwell();
+
+    configPage2.nCylinders = 8;
+    configPage4.sparkMode = IGN_MODE_WASTED;
+
+    currentStatus.battery10 = 105;
+    TEST_ASSERT_EQUAL(296, correctionsDwell(800));
+
+    currentStatus.battery10 = 65;
+    TEST_ASSERT_EQUAL(337, correctionsDwell(800));
+}
+
+static void test_correctionsDwell(void) {
+    RUN_TEST_P(test_correctionsDwell_nopertooth);
+    RUN_TEST_P(test_correctionsDwell_pertooth);
+    RUN_TEST_P(test_correctionsDwell_wasted_nopertooth_largerevolutiontime);
+    RUN_TEST_P(test_correctionsDwell_initialises_current_actualDwell);
+    RUN_TEST_P(test_correctionsDwell_uses_batvcorrection);
+    RUN_TEST_P(test_correctDwellClosedLoop_nochange);
+    RUN_TEST_P(test_correctDwellClosedLoop_smallError);
+    RUN_TEST_P(test_correctDwellClosedLoop_largeError);
+    RUN_TEST_P(test_correctDwellClosedLoop_clipComputed);
+    RUN_TEST_P(test_correctDwellClosedLoop_actualGreater);
+}
+
+void testIgnCorrections(void) {
+    SET_UNITY_FILENAME() {
+        test_correctionFixedTiming();
+        test_correctionCLTadvance();
+        test_correctionCrankingFixedTiming();
+        test_correctionFlexTiming();
+        test_correctionWMITiming();
+        test_correctionIATretard();
+        test_correctionIdleAdvance();
+        test_correctionSoftRevLimit();
+        test_correctionNitrous();
+        test_correctionSoftLaunch();
+        test_correctionSoftFlatShift();
+        test_correctionKnock();
+        // correctionDFCOignition() is tested in the fueling unit tests, since it is tightly coupled to fuel DFCO
+        test_correctionsDwell();
+    }
+}
